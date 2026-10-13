@@ -31,6 +31,7 @@ import (
 
 	gitlab "gitlab.com/gitlab-org/api/client-go"
 
+	"github.com/ossf/scorecard/v5/clients/internal/archive"
 	sce "github.com/ossf/scorecard/v5/errors"
 )
 
@@ -74,6 +75,18 @@ type tarballHandler struct {
 	tempDir     string
 	tempTarFile string
 	files       []string
+	// limits bounds how much the archive may expand when extracted.
+	// The zero value selects defaultLimits.
+	limits archive.Limits
+}
+
+// defaultLimits returns the extraction limits used when none are set.
+// GitLab documents a limit on push size but none on individual file size,
+// so only the total size (and entry count) bounds a file here.
+func defaultLimits() archive.Limits {
+	limits := archive.DefaultLimits()
+	limits.MaxEntryBytes = limits.MaxTotalBytes
+	return limits
 }
 
 type gitLabLint struct {
@@ -210,11 +223,18 @@ func (handler *tarballHandler) extractTarball() error {
 	if err != nil {
 		return fmt.Errorf("os.OpenFile: %w", err)
 	}
+	defer in.Close()
 	gz, err := gzip.NewReader(in)
 	if err != nil {
 		return fmt.Errorf("%w: gzip.NewReader %v %w", errTarballCorrupted, handler.tempTarFile, err)
 	}
+	defer gz.Close()
 	tr := tar.NewReader(gz)
+	limits := handler.limits
+	if limits == (archive.Limits{}) {
+		limits = defaultLimits()
+	}
+	budget := archive.NewBudget(limits)
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -222,6 +242,9 @@ func (handler *tarballHandler) extractTarball() error {
 		}
 		if err != nil {
 			return fmt.Errorf("%w tarReader.Next: %w", errTarballCorrupted, err)
+		}
+		if err := budget.CountEntry(header.Name); err != nil {
+			return handler.abortExtraction(err, gz, in)
 		}
 
 		switch header.Typeflag {
@@ -256,10 +279,13 @@ func (handler *tarballHandler) extractTarball() error {
 				return fmt.Errorf("os.Create: %w", err)
 			}
 
-			//nolint:gosec
-			// Potential for DoS vulnerability via decompression bomb.
-			// Since such an attack will only impact a single shard, ignoring this for now.
-			if _, err := io.Copy(outFile, tr); err != nil {
+			// The archive is attacker controlled, so bound how much it may expand to
+			// protect against decompression bombs.
+			if _, err := budget.CopyEntry(outFile, tr, header.Name, header.Size); err != nil {
+				outFile.Close()
+				if errors.Is(err, archive.ErrLimitExceeded) {
+					return handler.abortExtraction(err, gz, in)
+				}
 				return fmt.Errorf("%w io.Copy: %w", errTarballCorrupted, err)
 			}
 			outFile.Close()
@@ -273,6 +299,22 @@ func (handler *tarballHandler) extractTarball() error {
 		}
 	}
 	return nil
+}
+
+// abortExtraction deletes everything extracted so far and returns err with a hint on
+// how to scan the repository anyway. It is used when the archive goes over a limit.
+// Unlike errTarballCorrupted, the error is not skipped by setup(), so the checks fail
+// visibly instead of scoring a truncated copy of the repository.
+func (handler *tarballHandler) abortExtraction(err error, open ...io.Closer) error {
+	err = fmt.Errorf("%w; the repository is too large to scan from its archive, "+
+		"clone it and use --local instead", err)
+	for _, c := range open {
+		c.Close()
+	}
+	if cleanupErr := handler.cleanup(); cleanupErr != nil {
+		return errors.Join(err, cleanupErr)
+	}
+	return err
 }
 
 func (handler *tarballHandler) listFiles(predicate func(string) (bool, error)) ([]string, error) {
